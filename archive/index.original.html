@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>antigravity · particle field</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    html,body { width:100%; height:100%; overflow:hidden; background:#0a0d12; }
+    #c { position:fixed; inset:0; display:block; width:100%; height:100%; }
+    .overlay {
+      position:fixed; inset:0;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      z-index:1; pointer-events:none; user-select:none;
+    }
+    .overlay h1 {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: clamp(2.8rem, 7vw, 6rem);
+      font-weight: 500;
+      color: #e8eaed;
+      letter-spacing: -0.03em;
+    }
+    .overlay p {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: clamp(0.85rem, 1.4vw, 1rem);
+      color: rgba(255,255,255,0.32);
+      margin-top: 0.9rem;
+      letter-spacing: 0.04em;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div class="overlay">
+    <h1>antigravity</h1>
+    <p>drift, then disturb</p>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer }   from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass }       from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass }  from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass }       from 'three/addons/postprocessing/OutputPass.js';
+
+    // ───────── 常量 ─────────
+    const TEX  = 256;
+    const N    = TEX * TEX;
+    const HALF = 2.6;
+    const PR   = Math.min(window.devicePixelRatio || 1, 2);
+
+    // ───────── 渲染器 / 相机 / 场景 ─────────
+    const canvas   = document.getElementById('c');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(PR);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x0a0d12, 1);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping      = THREE.NoToneMapping;
+
+    if (!renderer.capabilities.isWebGL2 && !renderer.extensions.has('OES_texture_float')) {
+      console.warn('Float textures unsupported — particle simulation will not run.');
+    }
+
+    const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 10);
+    camera.position.set(0, 0, 3.5);
+    const scene = new THREE.Scene();
+
+    // ───────── 鼠标：NDC → z=0 平面坐标 + 速度估计 ─────────
+    const raycaster   = new THREE.Raycaster();
+    const pointer     = new THREE.Vector2(-999, -999);
+    const targetMouse = new THREE.Vector2(0, 0);
+    const mouse       = new THREE.Vector2(0, 0);
+    const prevMouse   = new THREE.Vector2(0, 0);
+    const rayPlane    = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const rayPoint    = new THREE.Vector3();
+    let   mouseSpeed  = 0;
+    let   mouseOn     = false;
+
+    function onMove(cx, cy) {
+      const r = canvas.getBoundingClientRect();
+      pointer.x =  ((cx - r.left) / r.width)  * 2 - 1;
+      pointer.y = -((cy - r.top)  / r.height) * 2 + 1;
+    }
+    window.addEventListener('pointermove', e => { onMove(e.clientX, e.clientY); mouseOn = true; });
+    window.addEventListener('pointerdown', e => { onMove(e.clientX, e.clientY); mouseOn = true; });
+    window.addEventListener('blur',        () => { mouseOn = false; });
+    document.addEventListener('mouseleave',() => { mouseOn = false; });
+
+    // ───────── 初始粒子状态 ─────────
+    //   posTex.rgba = (x, y, vx, vy)
+    //   refTex.rgba = (anchorX, anchorY, seedColor, seedSize)
+    const posArr = new Float32Array(N * 4);
+    const refArr = new Float32Array(N * 4);
+
+    for (let i = 0; i < N; i++) {
+      const i4 = i * 4;
+      const rx = (Math.random() - 0.5) * HALF * 2;
+      const ry = (Math.random() - 0.5) * HALF * 2;
+
+      refArr[i4]     = rx;
+      refArr[i4 + 1] = ry;
+      refArr[i4 + 2] = Math.random();
+      refArr[i4 + 3] = Math.random();
+
+      posArr[i4]     = rx;
+      posArr[i4 + 1] = ry;
+      posArr[i4 + 2] = 0;
+      posArr[i4 + 3] = 0;
+    }
+
+    const posTex = new THREE.DataTexture(posArr, TEX, TEX, THREE.RGBAFormat, THREE.FloatType);
+    posTex.minFilter = posTex.magFilter = THREE.NearestFilter;
+    posTex.needsUpdate = true;
+
+    const refTex = new THREE.DataTexture(refArr, TEX, TEX, THREE.RGBAFormat, THREE.FloatType);
+    refTex.minFilter = refTex.magFilter = THREE.NearestFilter;
+    refTex.needsUpdate = true;
+
+    // ───────── ping-pong RT ─────────
+    const rtOpts = {
+      type: THREE.FloatType, format: THREE.RGBAFormat,
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      depthBuffer: false, stencilBuffer: false,
+    };
+    let rtA = new THREE.WebGLRenderTarget(TEX, TEX, rtOpts);
+    let rtB = new THREE.WebGLRenderTarget(TEX, TEX, rtOpts);
+    let current = rtA, next = rtB;
+
+    // ───────── 通用 GLSL ─────────
+    const passVS = `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }`;
+
+    const NOISE = `
+      vec3 mod289(vec3 x){return x-floor(x*(1./289.))*289.;}
+      vec4 mod289(vec4 x){return x-floor(x*(1./289.))*289.;}
+      vec4 permute(vec4 x){return mod289(((x*34.)+1.)*x);}
+      vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-.85373472095314*r;}
+      float snoise(vec3 v){
+        const vec2 C=vec2(1./6.,1./3.); const vec4 D=vec4(0.,.5,1.,2.);
+        vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+        vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.-g;
+        vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+        vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+        i=mod289(i);
+        vec4 p=permute(permute(permute(i.z+vec4(0.,i1.z,i2.z,1.))+i.y+vec4(0.,i1.y,i2.y,1.))+i.x+vec4(0.,i1.x,i2.x,1.));
+        float n_=.142857142857; vec3 ns=n_*D.wyz-D.xzx;
+        vec4 j=p-49.*floor(p*ns.z*ns.z); vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.*x_);
+        vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy;
+        vec4 h=1.-abs(x)-abs(y); vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+        vec4 s0=floor(b0)*2.+1.; vec4 s1=floor(b1)*2.+1.; vec4 sh=-step(h,vec4(0.));
+        vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+        vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y);
+        vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+        vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+        p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
+        vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.); m=m*m;
+        return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+      }`;
+
+    // ───────── 初始化 pass：把 DataTexture 拷进 RT ─────────
+    const initMat = new THREE.ShaderMaterial({
+      uniforms: { uTex: { value: posTex } },
+      vertexShader: passVS,
+      fragmentShader: `
+        precision highp float;
+        uniform sampler2D uTex;
+        varying vec2 vUv;
+        void main() { gl_FragColor = texture2D(uTex, vUv); }
+      `,
+    });
+
+    // ───────── 物理 pass：spring + 鼠标排斥 + 噪声场 ─────────
+    //   此版调性：偏柔（弹簧软）、强氛围（噪声大）、长余韵（阻尼小）
+    const simUniforms = {
+      uPos:         { value: null },
+      uRef:         { value: refTex },
+      uTime:        { value: 0 },
+      uDt:          { value: 1 / 60 },
+      uMouse:       { value: new THREE.Vector2() },
+      uMouseSpeed:  { value: 0 },
+      uMouseOn:     { value: 0 },
+    };
+
+    const simMat = new THREE.ShaderMaterial({
+      uniforms: simUniforms,
+      vertexShader: passVS,
+      fragmentShader: `
+        precision highp float;
+        uniform sampler2D uPos, uRef;
+        uniform float uTime, uDt, uMouseSpeed, uMouseOn;
+        uniform vec2  uMouse;
+        varying vec2  vUv;
+        ${NOISE}
+
+        void main() {
+          vec4 p   = texture2D(uPos, vUv);
+          vec4 r   = texture2D(uRef, vUv);
+          vec2 pos = p.xy;
+          vec2 vel = p.zw;
+          vec2 anchor = r.xy;
+          float seed  = r.z;
+          float seed2 = r.w;
+
+          // ── 1. 锚点弹簧（柔，方便和噪声场叠加形成飘浮感）──
+          vec2 toAnchor = anchor - pos;
+          vec2 fSpring  = toAnchor * 2.4;
+
+          // ── 2. 鼠标排斥（仅 push，强度 = 基础悬停 + mouseSpeed）──
+          float R   = 0.45;
+          vec2  rel = pos - uMouse;
+          float md  = length(rel);
+          float fall = 1.0 - smoothstep(0.0, R, md);
+          fall = fall * fall;
+          float strength = (0.45 * uMouseOn + 5.0 * uMouseSpeed) * fall;
+          vec2 fPush = (md > 1e-4 ? rel / md : vec2(0.0)) * strength;
+
+          // ── 3. 环境噪声场（idle 呼吸的来源，比 optimized 更强）──
+          float t  = uTime * 0.16;
+          vec2  nP = pos * 0.40;
+          float n1 = snoise(vec3(nP,           t));
+          float n2 = snoise(vec3(nP + 23.7,    t + 8.3));
+          vec2  fAmbient = vec2(n1, n2) * 0.32 * (0.4 + 0.7 * seed2);
+
+          // ── 半隐式 Euler ──
+          vec2 force = fSpring + fPush + fAmbient;
+          vel += force * uDt;
+          vel *= 0.93;                    // 阻尼略小 → 余韵更长
+          vel  = clamp(vel, vec2(-8.0), vec2(8.0));
+          pos += vel * uDt;
+          pos  = clamp(pos, vec2(-${(HALF * 1.6).toFixed(2)}), vec2(${(HALF * 1.6).toFixed(2)}));
+
+          gl_FragColor = vec4(pos, vel);
+        }
+      `,
+    });
+
+    const simScene = new THREE.Scene();
+    const simCam   = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const simQuad  = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), initMat);
+    simScene.add(simQuad);
+
+    function pass(material, target) {
+      simQuad.material = material;
+      renderer.setRenderTarget(target);
+      renderer.render(simScene, simCam);
+      renderer.setRenderTarget(null);
+    }
+    pass(initMat, rtA);
+    pass(initMat, rtB);
+
+    // 预热：先跑 30 帧，让首屏粒子已经在轻微漂动
+    for (let i = 0; i < 30; i++) {
+      simUniforms.uPos.value        = current.texture;
+      simUniforms.uTime.value       = i / 60;
+      simUniforms.uMouseSpeed.value = 0;
+      simUniforms.uMouseOn.value    = 0;
+      pass(simMat, next);
+      [current, next] = [next, current];
+    }
+
+    // ───────── 渲染几何（每个纹素一个 point）─────────
+    const uvAttr = new Float32Array(N * 2);
+    for (let i = 0; i < N; i++) {
+      uvAttr[i * 2]     = (i % TEX + 0.5) / TEX;
+      uvAttr[i * 2 + 1] = (Math.floor(i / TEX) + 0.5) / TEX;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('uv',       new THREE.BufferAttribute(uvAttr, 2));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), HALF * 4);
+
+    //   调色：保留原始 Google 蓝调（比 optimized 略冷一点）
+    const dispUniforms = {
+      uPos:   { value: current.texture },
+      uRef:   { value: refTex },
+      uTime:  { value: 0 },
+      uPr:    { value: PR },
+      uVis:   { value: 0 },
+      uPS:    { value: 1.4 },
+      uC1:    { value: new THREE.Color('#669df6') },  // 标志蓝
+      uC2:    { value: new THREE.Color('#aecbfa') },  // 浅蓝
+      uC3:    { value: new THREE.Color('#e3edff') },  // 接近白
+      uC4:    { value: new THREE.Color('#ffffff') },  // 高光
+    };
+
+    const dispMat = new THREE.ShaderMaterial({
+      uniforms: dispUniforms,
+      vertexShader: `
+        precision highp float;
+        uniform sampler2D uPos, uRef;
+        uniform float uPr, uPS;
+        varying float vSpeed, vSeed, vSeed2;
+        void main() {
+          vec4 p = texture2D(uPos, uv);
+          vec4 r = texture2D(uRef, uv);
+          vec2 pos = p.xy;
+          vec2 vel = p.zw;
+          float seed  = r.z;
+          float seed2 = r.w;
+
+          // 透视景深的微 z 抖
+          float z = (seed2 - 0.5) * 0.55;
+          vec4 mv = modelViewMatrix * vec4(pos, z, 1.0);
+          gl_Position = projectionMatrix * mv;
+
+          float speed = length(vel);
+          vSpeed = speed;
+          vSeed  = seed;
+          vSeed2 = seed2;
+
+          // 比 optimized 略小，更像微尘
+          float base  = mix(1.0, 3.0, seed);
+          float burst = min(speed * 8.0, 2.5);
+          float size  = (base + burst) * uPS * uPr / max(-mv.z, 0.1);
+          gl_PointSize = clamp(size, 0.5, 70.0);
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+        uniform float uVis;
+        uniform vec3 uC1, uC2, uC3, uC4;
+        varying float vSpeed, vSeed, vSeed2;
+        void main() {
+          vec2 q = gl_PointCoord - 0.5;
+          float d = length(q);
+
+          // 高斯软盘
+          float disc = exp(-d * d * 7.5);
+
+          // 调色：seed 决定基色（深蓝→浅蓝→近白），速度往白色推
+          vec3 base = mix(uC1, uC2, smoothstep(0.0, 0.5, vSeed));
+          base      = mix(base, uC3, smoothstep(0.55, 1.0, vSeed));
+          float hot = smoothstep(0.02, 0.4, vSpeed);
+          vec3  col = mix(base, uC4, hot * 0.7);
+
+          // 静止时也有层次：seed2 给个亮度底
+          float bright = 0.5 + 0.5 * vSeed2 + 0.85 * hot;
+
+          float alpha = disc * uVis * (0.16 + 0.42 * hot + 0.10 * vSeed2);
+          if (alpha < 0.003) discard;
+          gl_FragColor = vec4(col * bright, alpha);
+        }
+      `,
+      transparent: true,
+      depthWrite:  false,
+      blending:    THREE.AdditiveBlending,
+    });
+
+    scene.add(new THREE.Points(geo, dispMat));
+
+    // ───────── 后处理：柔和 bloom ─────────
+    const composer = new EffectComposer(renderer);
+    composer.setPixelRatio(PR);
+    composer.setSize(window.innerWidth, window.innerHeight);
+    composer.addPass(new RenderPass(scene, camera));
+
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.50,   // strength：比 optimized 弱
+      0.60,   // radius
+      0.0     // threshold
+    );
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+
+    // ───────── 主循环 ─────────
+    let time    = 0;
+    let running = true;
+    document.addEventListener('visibilitychange', () => { running = !document.hidden; });
+
+    function loop() {
+      requestAnimationFrame(loop);
+      if (!running) return;
+
+      const dt = 1 / 60;
+      time += dt;
+
+      raycaster.setFromCamera(pointer, camera);
+      const denom = raycaster.ray.direction.dot(rayPlane.normal);
+      if (Math.abs(denom) > 1e-4) {
+        const tt = -(raycaster.ray.origin.dot(rayPlane.normal) + rayPlane.constant) / denom;
+        if (tt > 0) {
+          rayPoint.copy(raycaster.ray.origin).addScaledVector(raycaster.ray.direction, tt);
+          targetMouse.set(rayPoint.x, rayPoint.y);
+        }
+      }
+      mouse.lerp(targetMouse, 1 - Math.exp(-12 * dt));
+
+      // mouseSpeed = 世界坐标位移 / dt，平滑 + 截断
+      const raw    = Math.hypot(mouse.x - prevMouse.x, mouse.y - prevMouse.y) / dt;
+      const target = mouseOn ? Math.min(raw, 6.0) : 0;
+      mouseSpeed += (target - mouseSpeed) * 0.20;
+      prevMouse.copy(mouse);
+
+      simUniforms.uPos.value         = current.texture;
+      simUniforms.uTime.value        = time;
+      simUniforms.uDt.value          = dt;
+      simUniforms.uMouse.value.copy(mouse);
+      simUniforms.uMouseSpeed.value  = mouseSpeed;
+      simUniforms.uMouseOn.value     = mouseOn ? 1 : 0;
+      pass(simMat, next);
+      [current, next] = [next, current];
+
+      dispUniforms.uPos.value  = current.texture;
+      dispUniforms.uTime.value = time;
+      dispUniforms.uVis.value += (1 - dispUniforms.uVis.value) * Math.min(dt * 1.4, 1);
+
+      composer.render();
+    }
+
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth, h = window.innerHeight;
+      renderer.setSize(w, h);
+      composer.setSize(w, h);
+      bloom.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    });
+
+    requestAnimationFrame(loop);
+    console.log(`antigravity · ${N.toLocaleString()} particles · ambient · GPGPU + bloom`);
+  </script>
+</body>
+</html>

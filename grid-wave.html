@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grid Wave Background</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #1a1a1a;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    #bg-canvas {
+      position: fixed; top: 0; left: 0;
+      z-index: 0;
+      display: block;
+    }
+    .overlay {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      z-index: 1; pointer-events: none;
+      user-select: none;
+    }
+    .overlay h1 {
+      font-size: clamp(2.5rem, 6vw, 5rem);
+      font-weight: 600; color: #e0e0e0;
+      letter-spacing: -0.02em;
+    }
+    .overlay p {
+      font-size: clamp(1rem, 2vw, 1.3rem);
+      color: rgba(255,255,255,0.4);
+      margin-top: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bg-canvas"></canvas>
+
+  <div class="overlay">
+    <h1>Grid Wave</h1>
+    <p>Move your mouse to create ripples</p>
+  </div>
+
+  <script>
+    (function() {
+      var canvas = document.getElementById('bg-canvas');
+      var ctx = canvas.getContext('2d');
+
+      var width, height;
+      var mouse = { x: -1000, y: -1000 };
+      var time = 0;
+
+      var GRID_SIZE   = 6;   // 格子大小
+      var GAP         = 2;   // 格子间距
+      var CELL_SIZE   = GRID_SIZE + GAP;
+      var WAVE_SPEED  = 0.6; // 波浪速度
+      var MOUSE_R     = 150; // 鼠标影响半径
+      var MOUSE_FORCE = 0.3; // 鼠标力度
+
+      // ── 噪声种子（哈希函数）─────────────────
+      function hashOffset(x, y) {
+        var h = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+        return (h - Math.floor(h)) * Math.PI * 2;
+      }
+
+      // ── 有机噪声场 ───────────────────────────
+      function smoothOrganic(x, y, t) {
+        var baseFreq = 0.008;
+        var w1 = Math.sin(x * baseFreq + y * baseFreq * 0.3 + t * 0.015);
+        var w2 = Math.cos(y * baseFreq * 1.2 - x * baseFreq * 0.5 + t * 0.012);
+        var off = hashOffset(x * 0.05, y * 0.05);
+        var lw1 = Math.sin(x * 0.025 + y * 0.015 + t * 0.02 + off);
+        var lw2 = Math.cos((x - y) * 0.012 + t * 0.015);
+        var detail = Math.sin(x * 0.06 + off * 0.5) * Math.sin(y * 0.04 + t * 0.025) * 0.12;
+        return w1 * 0.35 + w2 * 0.25 + lw1 * 0.2 + lw2 * 0.15 + detail;
+      }
+
+      // ── 调整大小 ─────────────────────────────
+      function resize() {
+        width  = window.innerWidth;
+        height = window.innerHeight;
+        canvas.width  = width;
+        canvas.height = height;
+      }
+
+      // ── 绘制 ─────────────────────────────────
+      function draw() {
+        // 清屏
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(0, 0, width, height);
+
+        var mx = mouse.x;
+        var my = mouse.y;
+        if (typeof mx !== 'number' || isNaN(mx)) mx = -1000;
+        if (typeof my !== 'number' || isNaN(my)) my = -1000;
+
+        var cols = Math.ceil(width  / CELL_SIZE) + 1;
+        var rows = Math.ceil(height / CELL_SIZE) + 1;
+
+        for (var i = 0; i < cols; i++) {
+          for (var j = 0; j < rows; j++) {
+            var x = i * CELL_SIZE;
+            var y = j * CELL_SIZE;
+
+            // 计算该格子的噪声值
+            var value = smoothOrganic(x, y, time);
+
+            // 鼠标涟漪扰动
+            var dx = x - mx;
+            var dy = y - my;
+            var dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < MOUSE_R && dist > 0) {
+              var force = (1 - dist / MOUSE_R) * MOUSE_FORCE;
+              var ripple = Math.sin(dist * 0.05 - time * 0.12);
+              value += ripple * force * 0.5;
+            }
+
+            // 映射到 [0, 1]
+            value = (value + 1.2) / 2.4;
+
+            // 只有超过阈值的格子才绘制
+            if (value > 0.52) {
+              if (value > 0.72) {
+                // 高亮色：蓝绿色
+                var intensity = (value - 0.72) / 0.28;
+                var r = Math.floor(50  + intensity * 50);
+                var g = Math.floor(150 + intensity * 105);
+                var b = Math.floor(100 + intensity * 60);
+                ctx.fillStyle = 'rgba(' + r + ', ' + g + ', ' + b + ', 0.6)';
+              } else {
+                // 中间色：灰色
+                var intensity2 = (value - 0.52) / 0.2;
+                var gray = Math.floor(120 + intensity2 * 40);
+                ctx.fillStyle = 'rgba(' + gray + ', ' + gray + ', ' + gray + ', 0.45)';
+              }
+              ctx.fillRect(x, y, GRID_SIZE, GRID_SIZE);
+            }
+          }
+        }
+      }
+
+      // ── 动画循环 ─────────────────────────────
+      function animate() {
+        time += WAVE_SPEED;
+        draw();
+        requestAnimationFrame(animate);
+      }
+
+      // ── 事件监听 ─────────────────────────────
+      window.addEventListener('resize', resize);
+      window.addEventListener('mousemove', function(e) {
+        mouse.x = e.clientX;
+        mouse.y = e.clientY;
+      });
+      window.addEventListener('mouseleave', function() {
+        mouse.x = -1000;
+        mouse.y = -1000;
+      });
+
+      // 移动端触摸
+      window.addEventListener('touchmove', function(e) {
+        if (e.touches.length) {
+          mouse.x = e.touches[0].clientX;
+          mouse.y = e.touches[0].clientY;
+        }
+      }, { passive: true });
+      window.addEventListener('touchend', function() {
+        mouse.x = -1000; mouse.y = -1000;
+      });
+
+      // ── 启动 ─────────────────────────────────
+      resize();
+      requestAnimationFrame(animate);
+
+      // rAF 后备
+      (function() {
+        var ok = false;
+        var id = requestAnimationFrame(function() { ok = true; });
+        setTimeout(function() {
+          if (!ok) { cancelAnimationFrame(id); setInterval(function() { time += WAVE_SPEED; draw(); }, 33); }
+        }, 300);
+      })();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>antigravity · particle field</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    html,body { width:100%; height:100%; overflow:hidden; background:#121212; }
+    #c { position:fixed; top:0; left:0; display:block; width:100%; height:100%; }
+    .overlay {
+      position:fixed; top:0; left:0; width:100%; height:100%;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      z-index:1; pointer-events:none; user-select:none;
+    }
+    .overlay h1 { font-size:clamp(2.5rem,6vw,5rem); font-weight:600; color:#e8eaed; letter-spacing:-0.02em; }
+    .overlay p { font-size:clamp(0.9rem,1.8vw,1.2rem); color:rgba(255,255,255,0.35); margin-top:0.7rem; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div class="overlay"><h1>antigravity</h1><p>move your mouse over the field</p></div>
+
+  <script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    const TEX = 256, N = TEX * TEX, HALF = 1.2, PR = Math.min(window.devicePixelRatio, 2);
+
+    // ── 场景 ──
+    const canvas = document.getElementById('c');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(PR);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x121212, 1);
+
+    const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 10);
+    camera.position.set(0, 0, 3.5);
+    const scene = new THREE.Scene();
+
+    // ── 鼠标 ──
+    const raycaster = new THREE.Raycaster();
+    const pointer   = new THREE.Vector2(-999, -999);
+    const mousePos  = new THREE.Vector2(0, 0);
+    const targetMP  = new THREE.Vector2(0, 0);
+    const rayPlane  = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    let skipFrame   = false;
+    let mouseOn     = false; // 鼠标是否在页面上
+
+    function onMove(cx, cy) {
+      const r = canvas.getBoundingClientRect();
+      pointer.x = ((cx - r.left) / r.width) * 2 - 1;
+      pointer.y = -((cy - r.top) / r.height) * 2 + 1;
+    }
+    canvas.addEventListener('mousemove',   e => onMove(e.clientX, e.clientY));
+    canvas.addEventListener('mouseenter',   e => { mouseOn = true;  onMove(e.clientX, e.clientY); });
+    canvas.addEventListener('mouseleave', () => { mouseOn = false; targetMP.set(0, 0); mousePos.set(0, 0); });
+    canvas.addEventListener('touchmove',    e => { if (e.touches.length) onMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+
+    // ── 粒子数据 ──
+    const posArr = new Float32Array(N * 4); // x, y, scale, velocity
+    const refArr = new Float32Array(N * 4); // refX, refY, seed, seed2
+
+    for (let i = 0; i < N; i++) {
+      const rx = (Math.random() - 0.5) * HALF * 2;
+      const ry = (Math.random() - 0.5) * HALF * 2;
+      const s1 = Math.random(), s2 = Math.random();
+      refArr[i*4]   = rx;
+      refArr[i*4+1] = ry;
+      refArr[i*4+2] = s1;
+      refArr[i*4+3] = s2;
+      posArr[i*4]   = rx + (Math.random() - 0.5) * 0.05;
+      posArr[i*4+1] = ry + (Math.random() - 0.5) * 0.05;
+      posArr[i*4+2] = Math.random() * 0.5 + 0.3; // 初始可见
+      posArr[i*4+3] = Math.random() * 0.5;
+    }
+
+    let posTex = new THREE.DataTexture(posArr, TEX, TEX, THREE.RGBAFormat, THREE.FloatType);
+    posTex.minFilter = posTex.magFilter = THREE.NearestFilter;
+    posTex.needsUpdate = true;
+
+    function uploadTexture() { posTex.needsUpdate = true; }
+
+    // ── Points 几何 ──
+    const uvA = new Float32Array(N * 2);
+    for (let i = 0; i < N; i++) {
+      uvA[i*2]   = (i % TEX + 0.5) / TEX;
+      uvA[i*2+1] = (Math.floor(i / TEX) + 0.5) / TEX;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('uv', new THREE.BufferAttribute(uvA, 2));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+
+    // ── Simplex Noise ──
+    const NOISE = `
+      vec3 m289(vec3 x){return x-floor(x*(1./289.))*289.;}
+      vec4 m289(vec4 x){return x-floor(x*(1./289.))*289.;}
+      vec4 perm(vec4 x){return m289(((x*34.)+1.)*x);}
+      vec4 tInvSqrt(vec4 r){return 1.79284291400159-.85373472095314*r;}
+      float snoise(vec3 v){
+        const vec2 C=vec2(1./6.,1./3.);const vec4 D=vec4(0.,.5,1.,2.);
+        vec3 i=floor(v+dot(v,C.yyy));vec3 x0=v-i+dot(i,C.xxx);
+        vec3 g=step(x0.yzx,x0.xyz);vec3 l=1.-g;
+        vec3 i1=min(g.xyz,l.zxy);vec3 i2=max(g.xyz,l.zxy);
+        vec3 x1=x0-i1+C.xxx;vec3 x2=x0-i2+C.yyy;vec3 x3=x0-D.yyy;
+        i=m289(i);vec4 p=perm(perm(perm(i.z+vec4(0.,i1.z,i2.z,1.))+i.y+vec4(0.,i1.y,i2.y,1.))+i.x+vec4(0.,i1.x,i2.x,1.));
+        float n_=.142857142857;vec3 ns=n_*D.wyz-D.xzx;
+        vec4 j=p-49.*floor(p*ns.z*ns.z);vec4 x_=floor(j*ns.z);vec4 y_=floor(j-7.*x_);
+        vec4 x=x_*ns.x+ns.yyyy;vec4 y=y_*ns.x+ns.yyyy;
+        vec4 h=1.-abs(x)-abs(y);vec4 b0=vec4(x.xy,y.xy);vec4 b1=vec4(x.zw,y.zw);
+        vec4 s0=floor(b0)*2.+1.;vec4 s1=floor(b1)*2.+1.;vec4 sh=-step(h,vec4(0.));
+        vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+        vec3 p0=vec3(a0.xy,h.x);vec3 p1=vec3(a0.zw,h.y);vec3 p2=vec3(a1.xy,h.z);vec3 p3=vec3(a1.zw,h.w);
+        vec4 nrm=tInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+        p0*=nrm.x;p1*=nrm.y;p2*=nrm.z;p3*=nrm.w;
+        vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.);m=m*m;
+        return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+      }
+      float snoise(vec2 v,float t){return snoise(vec3(v,t));}`;
+
+    // ── Display Material ──
+    const uniforms = {
+      uPos:   { value: posTex },
+      uTime:  { value: 0 },
+      uMouse: { value: new THREE.Vector2(0, 0) },
+      uHov:   { value: 0 },
+      uPush:  { value: 0 },
+      uPr:    { value: PR },
+      uPS:    { value: 0.5 },
+      uAlpha: { value: 0.85 },
+      uVis:   { value: 0.0 },  // 鼠标在页面时 → 1，离开 → 0
+      uC1:    { value: new THREE.Color('#aecbfa') },
+      uC2:    { value: new THREE.Color('#669df6') },
+      uC3:    { value: new THREE.Color('#93bbfc') },
+    };
+
+    const mat = new THREE.ShaderMaterial({
+      uniforms,
+      vertexShader: `
+        uniform sampler2D uPos; uniform float uTime,uPr,uPS;
+        uniform vec2 uMouse; uniform float uHov,uPush;
+        varying float vS, vV;
+        ${NOISE}
+        void main(){
+          vec4 d = texture2D(uPos, uv);
+          vec2 p = d.xy; float s = d.z, v = d.w;
+
+          // 噪声漂移（低/中/高频三层）
+          float nd = smoothstep(0., .9, v);
+          float nx = snoise(p*10.,  uTime*.2+100.)*.005*nd;
+          float ny = snoise(p*10.,  uTime*.2)*.005*nd;
+          float nx2= snoise(p*.5,   uTime*.15+45.)*.02;
+          float ny2= snoise(p*.5,   uTime*.15+87.)*.02;
+
+          // 推出脉冲（鼠标周围的环状扩散）
+          float pr = .001+uPush*.15;
+          float dm = length(p-uMouse);
+          float ring = 1.-smoothstep(0., pr, dm);
+          vec3 fp = vec3(p.x+nx+nx2, p.y+ny+ny2, 0.);
+          fp.xy += normalize(fp.xy-uMouse+.001)*ring*.005*uPush;
+
+          // 粒子大小
+          float sz = (s*7.)*(uPr*.5)*uPS + .25*uPr;
+          gl_PointSize = clamp(sz, 1., 64.);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(fp, 1.);
+
+          vS = s; vV = v;
+        }`,
+      fragmentShader: `
+        varying float vS, vV;
+        uniform float uAlpha, uVis; uniform vec3 uC1, uC2, uC3;
+        void main(){
+          vec2 uv = gl_PointCoord.xy - .5;
+          float d  = length(uv);
+          float disc = pow(1.-smoothstep(0., .5, d), 1.5);
+
+          // 速度分区三色渐变
+          float t1 = smoothstep(0., .3, vV);
+          float t2 = smoothstep(.3, .7, vV);
+          vec3 col = mix(uC1, uC2, t1);
+          col = mix(col, uC3, t2);
+
+          float alpha = uAlpha * disc * smoothstep(.1, .2, vS) * uVis;
+          if (alpha < .01) discard;
+          gl_FragColor = vec4(col, alpha);
+        }`,
+      transparent: true, depthWrite: false,
+      blending: THREE.NormalBlending,
+    });
+
+    scene.add(new THREE.Points(geo, mat));
+
+    // ── 物理更新 (CPU Spring-Mass) ──
+    let time = 0;
+
+    function physics(dt) {
+      time += dt;
+      const mx = targetMP.x, my = targetMP.y;
+
+      for (let i = 0; i < N; i++) {
+        const i4 = i * 4;
+        let x = posArr[i4], y = posArr[i4+1], s = posArr[i4+2], v = posArr[i4+3];
+        const rx = refArr[i4], ry = refArr[i4+1], seed = refArr[i4+2], seed2 = refArr[i4+3];
+
+        // 生命周期（每个粒子 3~4 秒）
+        const lifeEnd = 3.0 + Math.sin(seed2 * 100) * 1.0;
+        let life = (seed * 100 + time) % lifeEnd;
+
+        // 目标位置：悬停时向鼠标靠拢
+        const hp2 = uniforms.uHov.value * uniforms.uHov.value;
+        const tx = rx + (mx - rx) * hp2;
+        const ty = ry + (my - ry) * hp2;
+
+        // 弹簧力 + 阻尼
+        const dx = tx - x, dy = ty - y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const dirX = dist > 0.001 ? dx/dist : 0;
+        const dirY = dist > 0.001 ? dy/dist : 0;
+        const moveX = dirX * 0.01 * (1 + dist * 0.5);
+        const moveY = dirY * 0.01 * (1 + dist * 0.5);
+
+        // 推出脉冲
+        const dm = Math.sqrt((x-mx)*(x-mx) + (y-my)*(y-my));
+        const pStr = dm < 0.2 ? (1 - dm/0.2) * 0.03 * uniforms.uPush.value : 0;
+        const pDirX = dm > 0.001 ? (x-mx)/dm : 0;
+        const pDirY = dm > 0.001 ? (y-my)/dm : 0;
+
+        // 速度（惯性 + 阻尼）
+        const nv = Math.min(Math.sqrt((moveX+pDirX*pStr)*(moveX+pDirX*pStr)+(moveY+pDirY*pStr)*(moveY+pDirY*pStr)) * 50, 1);
+        v = Math.max(0, Math.min(v + (nv - v) * 0.3, 1));
+        v *= 0.97;
+
+        // 位置（阻尼因子 0.2 = 弹簧的 critical damping-like）
+        x += (moveX + pDirX * pStr) * 0.2;
+        y += (moveY + pDirY * pStr) * 0.2;
+
+        // 缩放
+        let ts = Math.max(0, Math.min(1, life < 0.5 ? life/0.5 : (lifeEnd-life)/lifeEnd));
+        ts += Math.max(0, 1 - dm/0.1) * 1.5 * hp2;
+        if (life < 0.01) { x = rx; y = ry; ts = 0; v = 0; }
+        s = Math.max(0, Math.min(s + (ts - s) * 0.15, 2));
+
+        posArr[i4]   = x;
+        posArr[i4+1] = y;
+        posArr[i4+2] = s;
+        posArr[i4+3] = v;
+      }
+    }
+
+    // ── 预热 ──
+    uniforms.uHov.value = 0;
+    for (let w = 0; w < 120; w++) physics(1/60);
+    uploadTexture();
+
+    // ── 进度 ──
+    let hovP = 0, pushP = 0;
+
+    // ── 主循环 ──
+    function loop() {
+      requestAnimationFrame(loop);
+
+      const dt = 1 / 60;
+
+      // Raycaster → 鼠标在平面上的交点
+      skipFrame = !skipFrame;
+      if (skipFrame) {
+        raycaster.setFromCamera(pointer, camera);
+        const pt = new THREE.Vector3();
+        const d = raycaster.ray.direction.dot(rayPlane.normal);
+        if (Math.abs(d) > 0.0001) {
+          const t2 = -(raycaster.ray.origin.dot(rayPlane.normal) + rayPlane.constant) / d;
+          if (t2 > 0) {
+            pt.copy(raycaster.ray.origin).addScaledVector(raycaster.ray.direction, t2);
+            targetMP.set(pt.x, pt.y);
+          }
+        }
+      }
+      mousePos.lerp(targetMP, 1 - Math.exp(-8 * dt));
+
+      // 悬停进度（0.5s 渐入 / 0.4s 渐出）
+      const h = pointer.x >= -1 && pointer.x <= 1;
+      if (h) { hovP = Math.min(hovP + dt/0.5, 1); pushP = Math.min(pushP + dt/2.0, 1); }
+      else  { hovP = Math.max(hovP - dt/0.4, 0); pushP = Math.max(pushP - dt/0.4, 0); }
+      uniforms.uHov.value  = hovP;
+      uniforms.uPush.value = pushP;
+
+      // 物理更新
+      physics(dt);
+      uploadTexture();
+
+      // 更新 uniforms
+      uniforms.uTime.value = time;
+      uniforms.uMouse.value.copy(mousePos);
+
+      // uVis 平滑过渡（鼠标进入淡入 0.3s，离开淡出 0.5s）
+      const targetVis = mouseOn ? 1 : 0;
+      const speed = mouseOn ? 5 : 3;
+      uniforms.uVis.value += (targetVis - uniforms.uVis.value) * Math.min(dt * speed, 1);
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth, h = window.innerHeight;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    });
+
+    requestAnimationFrame(loop);
+    let rf = false, tid = requestAnimationFrame(() => { rf = true; });
+    setTimeout(() => { if (!rf) { cancelAnimationFrame(tid); setInterval(loop, 33); } }, 300);
+    console.log('antigravity · 65,536 particles · CPU physics');
+  </script>
+</body>
+</html>
